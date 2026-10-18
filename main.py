@@ -15,22 +15,55 @@ REDIS_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 app = FastAPI()
 
 
+
 def check_rate_limit(client):
-    window = int(time.time() // 10)
-    key = f"fastapi-middleware:rate:{client}:{window}"
+    import hashlib
+
+    now = int(time.time() * 1000)
+    key = "fastapi-middleware:rolling:" + hashlib.sha256(
+        client.encode()
+    ).hexdigest()
+
+    script = """
+    local key = KEYS[1]
+    local now = tonumber(ARGV[1])
+    local window = 10000
+    local limit = 15
+
+    redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
+
+    local count = redis.call('ZCARD', key)
+
+    if count >= limit then
+        return 0
+    end
+
+    redis.call('ZADD', key, now, ARGV[2])
+    redis.call('PEXPIRE', key, window)
+
+    return 1
+    """
 
     response = requests.post(
-        REDIS_URL + "/pipeline",
-        headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+        REDIS_URL,
+        headers={
+            "Authorization": f"Bearer {REDIS_TOKEN}",
+            "Content-Type": "application/json"
+        },
         json=[
-            ["INCR", key],
-            ["EXPIRE", key, 20]
+            "EVAL",
+            script,
+            "1",
+            key,
+            str(now),
+            f"{now}:{uuid.uuid4()}"
         ],
         timeout=5
     )
+
     response.raise_for_status()
-    count = int(response.json()[0]["result"])
-    return count <= 15
+    return int(response.json()["result"]) == 1
+
 
 
 @app.middleware("http")
