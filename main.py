@@ -1,23 +1,37 @@
 
-import time
+import os
 import uuid
-from collections import defaultdict, deque
-from threading import Lock
+import time
+import requests
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 EMAIL = "24f3004934@ds.study.iitm.ac.in"
-ALLOWED_ORIGINS = [
-    "https://app-b3pq17.example.com",
-    "https://exam.sanand.workers.dev",
-]
+REDIS_URL = os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/")
+REDIS_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 
 app = FastAPI()
 
-buckets = defaultdict(deque)
-lock = Lock()
+
+def check_rate_limit(client):
+    window = int(time.time() // 10)
+    key = f"fastapi-middleware:rate:{client}:{window}"
+
+    response = requests.post(
+        REDIS_URL + "/pipeline",
+        headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+        json=[
+            ["INCR", key],
+            ["EXPIRE", key, 20]
+        ],
+        timeout=5
+    )
+    response.raise_for_status()
+    count = int(response.json()[0]["result"])
+    return count <= 15
+
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
@@ -25,19 +39,20 @@ async def rate_limit(request: Request, call_next):
         return await call_next(request)
 
     client = request.headers.get("X-Client-ID", "anonymous")
-    now = time.monotonic()
 
-    with lock:
-        bucket = buckets[client]
-        while bucket and now - bucket[0] >= 10:
-            bucket.popleft()
+    try:
+        allowed = check_rate_limit(client)
+    except Exception:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Rate limiter unavailable"}
+        )
 
-        if len(bucket) >= 15:
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded"}
-            )
-        bucket.append(now)
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded"}
+        )
 
     return await call_next(request)
 
@@ -60,11 +75,13 @@ async def ping(request: Request):
     }
 
 
-# Outermost middleware handles CORS, including 429 responses.
 app = CORSMiddleware(
     app,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=[
+        "https://app-b3pq17.example.com",
+        "https://exam.sanand.workers.dev"
+    ],
     allow_methods=["GET", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["X-Request-ID"],
+    expose_headers=["X-Request-ID"]
 )
